@@ -1,3 +1,7 @@
+#include <boost/uuid/uuid.hpp>
+#include <boost/uuid/uuid_generators.hpp>
+#include <boost/uuid/uuid_io.hpp>
+#include <nlohmann/json.hpp>
 #include <plog/Init.h>
 #include <plog/Log.h>
 #include <websocketpp/client.hpp>
@@ -6,33 +10,45 @@
 #include "nostr.hpp"
 #include "client/web_socket_client.hpp"
 
+using boost::uuids::random_generator;
+using boost::uuids::to_string;
+using boost::uuids::uuid;
+using nlohmann::json;
 using std::async;
+using std::function;
 using std::future;
 using std::lock_guard;
 using std::make_tuple;
 using std::move;
 using std::mutex;
+using std::out_of_range;
+using std::shared_ptr;
 using std::string;
 using std::thread;
 using std::tuple;
+using std::unique_ptr;
 using std::vector;
 
 namespace nostr
 {
-NostrService::NostrService(plog::IAppender* appender, client::IWebSocketClient* client)
-    : NostrService(appender, client, {}) { };
+NostrService::NostrService(
+    shared_ptr<plog::IAppender> appender,
+    shared_ptr<client::IWebSocketClient> client)
+: NostrService(appender, client, {}) { };
 
-NostrService::NostrService(plog::IAppender* appender, client::IWebSocketClient* client, RelayList relays)
-    : _defaultRelays(relays), _client(client)
+NostrService::NostrService(
+    shared_ptr<plog::IAppender> appender,
+    shared_ptr<client::IWebSocketClient> client,
+    RelayList relays)
+: _defaultRelays(relays), _client(client)
 { 
-    plog::init(plog::debug, appender);
+    plog::init(plog::debug, appender.get());
     client->start();
 };
 
 NostrService::~NostrService()
 {
     this->_client->stop();
-    delete this->_client;
 };
 
 RelayList NostrService::defaultRelays() const { return this->_defaultRelays; };
@@ -104,20 +120,18 @@ void NostrService::closeRelayConnections(RelayList relays)
 
 tuple<RelayList, RelayList> NostrService::publishEvent(Event event)
 {
-    // TODO: Add validation function.
-
     RelayList successfulRelays;
     RelayList failedRelays;
 
     PLOG_INFO << "Attempting to publish event to Nostr relays.";
 
     vector<future<tuple<string, bool>>> publishFutures;
-    for (string relay : this->_activeRelays)
+    for (const string& relay : this->_activeRelays)
     {
-        future<tuple<string, bool>> publishFuture = async([this, relay, event]() {
-            return this->_client->send(event.serialize(), relay);
+        future<tuple<string, bool>> publishFuture = async([this, &relay, &event]() {
+            return this->_client->send(event.serialize(this->_signer), relay);
         });
-        
+
         publishFutures.push_back(move(publishFuture));
     }
 
@@ -137,6 +151,182 @@ tuple<RelayList, RelayList> NostrService::publishEvent(Event event)
     size_t targetCount = this->_activeRelays.size();
     size_t successfulCount = successfulRelays.size();
     PLOG_INFO << "Published event to " << successfulCount << "/" << targetCount << " target relays.";
+
+    return make_tuple(successfulRelays, failedRelays);
+};
+
+string NostrService::queryRelays(Filters filters)
+{
+    return this->queryRelays(filters, [this](string subscriptionId, Event event) {
+        lock_guard<mutex> lock(this->_propertyMutex);
+        this->_eventIterators[subscriptionId] = this->_events[subscriptionId].begin();
+        this->onEvent(subscriptionId, event);
+    });
+};
+
+string NostrService::queryRelays(Filters filters, function<void(const string&, Event)> responseHandler)
+{
+    RelayList successfulRelays;
+    RelayList failedRelays;
+
+    string subscriptionId = this->generateSubscriptionId();
+    vector<future<tuple<string, bool>>> requestFutures;
+    for (const string relay : this->_activeRelays)
+    {
+        lock_guard<mutex> lock(this->_propertyMutex);
+        this->_subscriptions[relay].push_back(subscriptionId);
+        string request = filters.serialize(subscriptionId);
+
+        future<tuple<string, bool>> requestFuture = async([this, &relay, &request]() {
+            return this->_client->send(request, relay);
+        });
+        requestFutures.push_back(move(requestFuture));
+
+        this->_client->receive(relay, [this, responseHandler](string payload) {
+            this->onMessage(payload, responseHandler);
+        });
+    }
+
+    for (auto& publishFuture : requestFutures)
+    {
+        auto [relay, isSuccess] = publishFuture.get();
+        if (isSuccess)
+        {
+            successfulRelays.push_back(relay);
+        }
+        else
+        {
+            failedRelays.push_back(relay);
+        }
+    }
+
+    size_t targetCount = this->_activeRelays.size();
+    size_t successfulCount = successfulRelays.size();
+    PLOG_INFO << "Sent query to " << successfulCount << "/" << targetCount << " open relay connections.";
+
+    return subscriptionId;
+};
+
+vector<Event> NostrService::getNewEvents()
+{
+    vector<Event> newEvents;
+
+    for (auto& [subscriptionId, events] : this->_events)
+    {
+        vector<Event> subscriptionEvents = this->getNewEvents(subscriptionId);
+        newEvents.insert(newEvents.end(), subscriptionEvents.begin(), subscriptionEvents.end());
+    }
+
+    return newEvents;
+};
+
+vector<Event> NostrService::getNewEvents(string subscriptionId)
+{
+    if (this->_events.find(subscriptionId) == this->_events.end())
+    {
+        PLOG_ERROR << "No events found for subscription: " << subscriptionId;
+        throw out_of_range("No events found for subscription: " + subscriptionId);
+    }
+
+    if (this->_eventIterators.find(subscriptionId) == this->_eventIterators.end())
+    {
+        PLOG_ERROR << "No event iterator found for subscription: " << subscriptionId;
+        throw out_of_range("No event iterator found for subscription: " + subscriptionId);
+    }
+
+    lock_guard<mutex> lock(this->_propertyMutex);
+    vector<Event> newEvents;
+    vector<Event> receivedEvents = this->_events[subscriptionId];
+    vector<Event>::iterator eventIt = this->_eventIterators[subscriptionId];
+
+    while (eventIt != receivedEvents.end())
+    {
+        newEvents.push_back(move(*eventIt));
+        eventIt++;
+    }
+
+    return newEvents;
+};
+
+tuple<RelayList, RelayList> NostrService::closeSubscription(string subscriptionId)
+{
+    RelayList successfulRelays;
+    RelayList failedRelays;
+
+    vector<future<tuple<string, bool>>> closeFutures;
+    for (const string relay : this->_activeRelays)
+    {
+        if (!this->hasSubscription(relay, subscriptionId))
+        {
+            continue;
+        }
+
+        string request = this->generateCloseRequest(subscriptionId);
+        future<tuple<string, bool>> closeFuture = async([this, &relay, &request]() {
+            return this->_client->send(request, relay);
+        });
+        closeFutures.push_back(move(closeFuture));
+    }
+
+    for (auto& closeFuture : closeFutures)
+    {
+        auto [relay, isSuccess] = closeFuture.get();
+        if (isSuccess)
+        {
+            successfulRelays.push_back(relay);
+        }
+        else
+        {
+            failedRelays.push_back(relay);
+        }
+    }
+
+    size_t targetCount = this->_activeRelays.size();
+    size_t successfulCount = successfulRelays.size();
+    PLOG_INFO << "Sent close request to " << successfulCount << "/" << targetCount << " open relay connections.";
+
+    return make_tuple(successfulRelays, failedRelays);
+};
+
+tuple<RelayList, RelayList> NostrService::closeSubscriptions()
+{
+    return this->closeSubscriptions(this->_activeRelays);
+};
+
+tuple<RelayList, RelayList> NostrService::closeSubscriptions(RelayList relays)
+{
+    RelayList successfulRelays;
+    RelayList failedRelays;
+
+    vector<future<tuple<RelayList, RelayList>>> closeFutures;
+    for (const string relay : relays)
+    {
+        future<tuple<RelayList, RelayList>> closeFuture = async([this, &relay]() {
+            RelayList successfulRelays;
+            RelayList failedRelays;
+
+            for (const string& subscriptionId : this->_subscriptions[relay])
+            {
+                auto [successes, failures] = this->closeSubscription(subscriptionId);
+                successfulRelays.insert(successfulRelays.end(), successes.begin(), successes.end());
+                failedRelays.insert(failedRelays.end(), failures.begin(), failures.end());
+            }
+
+            return make_tuple(successfulRelays, failedRelays);
+        });
+        closeFutures.push_back(move(closeFuture));
+    }
+
+    for (auto& closeFuture : closeFutures)
+    {
+        auto [successes, failures] = closeFuture.get();
+        successfulRelays.insert(successfulRelays.end(), successes.begin(), successes.end());
+        failedRelays.insert(failedRelays.end(), failures.begin(), failures.end());
+    }
+
+    size_t targetCount = relays.size();
+    size_t successfulCount = successfulRelays.size();
+    PLOG_INFO << "Sent close requests to " << successfulCount << "/" << targetCount << " open relay connections.";
 
     return make_tuple(successfulRelays, failedRelays);
 };
@@ -244,5 +434,67 @@ void NostrService::disconnect(string relay)
 
     lock_guard<mutex> lock(this->_propertyMutex);
     this->eraseActiveRelay(relay);
+};
+
+string NostrService::generateSubscriptionId()
+{
+    uuid uuid = random_generator()();
+    return to_string(uuid);
+};
+
+string NostrService::generateCloseRequest(string subscriptionId)
+{
+    json jarr = json::array({ "CLOSE", subscriptionId });
+    return jarr.dump();
+};
+
+bool NostrService::hasSubscription(string relay, string subscriptionId)
+{
+    auto it = find(this->_subscriptions[relay].begin(), this->_subscriptions[relay].end(), subscriptionId);
+    if (it != this->_subscriptions[relay].end()) // If the subscription is in this->_subscriptions[relay]
+    {
+        return true;
+    }
+    return false;
+};
+
+void NostrService::onMessage(string message, function<void(const string&, Event)> eventHandler)
+{
+    json jarr = json::array();
+    jarr = json::parse(message);
+
+    string messageType = jarr[0];
+
+    if (messageType == "EVENT")
+    {
+        string subscriptionId = jarr[1];
+        string serializedEvent = jarr[2].dump();
+        Event event;
+        event.deserialize(message);
+        eventHandler(subscriptionId, event);
+    }
+
+    // Support other message types here, if necessary.
+};
+
+void NostrService::onEvent(string subscriptionId, Event event)
+{
+    lock_guard<mutex> lock(this->_propertyMutex);
+    _events[subscriptionId].push_back(event);
+    PLOG_INFO << "Received event for subscription: " << subscriptionId;
+
+    // To protect memory, only keep a limited number of events per subscription.
+    while (_events[subscriptionId].size() > NostrService::MAX_EVENTS_PER_SUBSCRIPTION)
+    {
+        auto startIt = _events[subscriptionId].begin();
+        auto eventIt = _eventIterators[subscriptionId];
+
+        if (eventIt == startIt)
+        {
+            eventIt++;
+        }
+
+        _events[subscriptionId].erase(_events[subscriptionId].begin());
+    }
 };
 } // namespace nostr

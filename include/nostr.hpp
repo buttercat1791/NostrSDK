@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <mutex>
 #include <string>
 #include <tuple>
@@ -15,8 +16,11 @@
 namespace nostr
 {
 typedef std::vector<std::string> RelayList;
+typedef std::unordered_map<std::string, std::vector<std::string>> TagMap;
 
-// TODO: Add null checking to seralization and deserialization methods.
+class ISigner;
+class NostrService;
+
 /**
  * @brief A Nostr event.
  * @remark All data transmitted over the Nostr protocol is encoded in JSON blobs.  This struct
@@ -27,21 +31,89 @@ struct Event
 {
     std::string id; ///< SHA-256 hash of the event data.
     std::string pubkey; ///< Public key of the event creator.
-    std::string created_at; ///< Unix timestamp of the event creation.
+    std::time_t createdAt; ///< Unix timestamp of the event creation.
     int kind; ///< Event kind.
     std::vector<std::vector<std::string>> tags; ///< Arbitrary event metadata.
     std::string content; ///< Event content.
     std::string sig; ///< Event signature created with the private key of the event creator.
 
-    nlohmann::json serialize() const;
+    /**
+     * @brief Serializes the event to a JSON object.
+     * @returns A stringified JSON object representing the event.
+     * @throws `std::invalid_argument` if the event object is invalid.
+     */
+    std::string serialize(std::shared_ptr<ISigner> signer);
+
+    /**
+     * @brief Deserializes the event from a JSON string.
+     * @param jsonString A stringified JSON object representing the event.
+     */
     void deserialize(std::string jsonString);
+
+private:
+    /**
+     * @brief Validates the event.
+     * @throws `std::invalid_argument` if the event object is invalid.
+     * @remark The `createdAt` field defaults to the present if it is not already set.
+     */
+    void validate();
+
+    /**
+     * @brief Generates an ID for the event.
+     * @param serializedData The serialized JSON string of all of the event data except the ID and
+     * the signature.
+     * @return A valid Nostr event ID.
+     * @remark The ID is a 32-bytes lowercase hex-encoded sha256 of the serialized event data.
+     */
+    std::string generateId(std::string serializedData) const;
+};
+
+/**
+ * @brief A set of filters for querying Nostr relays.
+ * @remark The `limit` field should always be included to keep the response size reasonable.  The
+ * `since` field is not required, and the `until` field will default to the present.  At least one
+ * of the other fields must be set for a valid filter.
+ */
+struct Filters
+{
+    std::vector<std::string> ids; ///< Event IDs.
+    std::vector<std::string> authors; ///< Event author npubs.
+    std::vector<int> kinds; ///< Kind numbers.
+    TagMap tags; ///< Tag names mapped to lists of tag values.
+    std::time_t since; ///< Unix timestamp.  Matching events must be newer than this.
+    std::time_t until; ///< Unix timestamp.  Matching events must be older than this.
+    int limit; ///< The maximum number of events the relay should return on the initial query.
+
+    /**
+     * @brief Serializes the filters to a JSON object.
+     * @param subscriptionId A string up to 64 chars in length that is unique per relay connection.
+     * @returns A stringified JSON object representing the filters.
+     * @throws `std::invalid_argument` if the filter object is invalid.
+     * @remarks The Nostr client is responsible for managing subscription IDs.  Responses from the
+     * relay will be organized by subscription ID.
+     */
+    std::string serialize(std::string subscriptionId);
+
+private:
+    /**
+     * @brief Validates the filters.
+     * @throws `std::invalid_argument` if the filter object is invalid.
+     * @remark The `until` field defaults to the present if it is not already set.
+     */
+    void validate();
 };
 
 class NostrService
 {
+// TODO: Setup signer in the constructor.
 public:
-    NostrService(plog::IAppender* appender, client::IWebSocketClient* client);
-    NostrService(plog::IAppender* appender, client::IWebSocketClient* client, RelayList relays);
+    NostrService(
+        std::shared_ptr<plog::IAppender> appender,
+        std::shared_ptr<client::IWebSocketClient> client);
+    NostrService(
+        std::shared_ptr<plog::IAppender> appender,
+        std::shared_ptr<client::IWebSocketClient> client,
+        RelayList relays);
     ~NostrService();
 
     RelayList defaultRelays() const;
@@ -79,13 +151,86 @@ public:
     */
     std::tuple<RelayList, RelayList> publishEvent(Event event);
 
-    // TODO: Add methods for reading events from relays.
+    /**
+     * @brief Queries all open relay connections for events matching the given set of filters.
+     * @param filters The filters to use for the query.
+     * @returns The ID of the subscription created for the query.
+     * @remarks The service will store a limited number of events returned from the relay for the
+     * given filters.  These events may be retrieved via `getNewEvents`.
+     */
+    std::string queryRelays(Filters filters);
+
+    /**
+     * @brief Queries all open relay connections for events matching the given set of filters.
+     * @param filters The filters to use for the query.
+     * @param responseHandler A callable object that will be invoked each time the client receives
+     * an event matching the filters.
+     * @returns The ID of the subscription created for the query.
+     * @remark By providing a response handler, the caller assumes responsibility for handling all
+     * events returned from the relay for the given filters.  The service will not store the
+     * events, and they will not be accessible via `getNewEvents`.
+     */
+    std::string queryRelays(Filters filters, std::function<void(const std::string&, Event)> responseHandler);
+
+    /**
+     * @brief Get any new events received since the last call to this method, across all
+     * subscriptions.
+     * @returns A pointer to a vector of new events.
+     */
+    std::vector<Event> getNewEvents();
+
+    /**
+     * @brief Get any new events received since the last call to this method, for the given
+     * subscription.
+     * @returns A pointer to a vector of new events.
+     */
+    std::vector<Event> getNewEvents(std::string subscriptionId);
+    
+    /**
+     * @brief Closes the subscription with the given ID on all open relay connections.
+     * @returns A tuple of `RelayList` objects, of the form `<successes, failures>`, indicating
+     * to which relays the message was sent successfully, and which relays failed to receive the
+     * message.
+     */
+    std::tuple<RelayList, RelayList> closeSubscription(std::string subscriptionId);
+
+    /**
+     * @brief Closes all open subscriptions on all open relay connections.
+     * @returns A tuple of `RelayList` objects, of the form `<successes, failures>`, indicating
+     * to which relays the message was sent successfully, and which relays failed to receive the
+     * message.
+     */
+    std::tuple<RelayList, RelayList> closeSubscriptions();
+
+    /**
+     * @brief Closes all open subscriptions on the given relays.
+     * @returns A tuple of `RelayList` objects, of the form `<successes, failures>`, indicating
+     * to which relays the message was sent successfully, and which relays failed to receive the
+     * message.
+     */
+    std::tuple<RelayList, RelayList> closeSubscriptions(RelayList relays);
 
 private:
+    ///< The maximum number of events the service will store for each subscription.
+    const int MAX_EVENTS_PER_SUBSCRIPTION = 128;
+
+    ///< The WebSocket client used to communicate with relays.
+    std::shared_ptr<client::IWebSocketClient> _client;
+    ///< The signer used to sign Nostr events.
+    std::shared_ptr<ISigner> _signer;
+
+    ///< A mutex to protect the instance properties.
     std::mutex _propertyMutex;
+    ///< The default set of Nostr relays to which the service will attempt to connect.
     RelayList _defaultRelays;
-    RelayList _activeRelays;
-    client::IWebSocketClient* _client;
+    ///< The set of Nostr relays to which the service is currently connected.
+    RelayList _activeRelays; 
+    ///< A map from relay URIs to the subscription IDs open on each relay.
+    std::unordered_map<std::string, std::vector<std::string>> _subscriptions;
+    ///< A map from subscription IDs to the events returned by the relays for each subscription.
+    std::unordered_map<std::string, std::vector<Event>> _events;
+    ///< A map from the subscription IDs to the latest read event for each subscription.
+    std::unordered_map<std::string, std::vector<Event>::iterator> _eventIterators;
 
     /**
      * @brief Determines which of the given relays are currently connected.
@@ -119,5 +264,44 @@ private:
      * @brief Closes the connection from the client to the given relay.
      */
     void disconnect(std::string relay);
+
+    /**
+     * @brief Generates a unique subscription ID that may be used to identify event requests.
+     * @returns A stringified UUID.
+     */
+    std::string generateSubscriptionId();
+
+    /**
+     * @brief Generates a message requesting a relay to close the subscription with the given ID.
+     * @returns A stringified JSON object representing the close request.
+     */
+    std::string generateCloseRequest(std::string subscriptionId);
+
+    /**
+     * @brief Indicates whether the connection to the given relay has a subscription with the given
+     * ID.
+     * @returns True if the relay has the subscription, false otherwise.
+     */
+    bool hasSubscription(std::string relay, std::string subscriptionId);
+
+    /**
+     * @brief Parses messages received from the relay and invokes the appropriate message handler.
+     */
+    void onMessage(std::string message, std::function<void(const std::string&, Event)> eventHandler);
+
+    /**
+     * @brief A default message handler for events returned from relay queries.
+     * @param subscriptionId The ID of the subscription for which the event was received.
+     * @param event The event received from the relay.
+     * @remark By default, new events are stored in a map of subscription IDs to vectors of events.
+     * Events are retrieved by calling `getNewEvents` or `getNewEvents(subscriptionId)`.
+     */
+    void onEvent(std::string subscriptionId, Event event);
+};
+
+class ISigner
+{
+public:
+    virtual std::string generateSignature(std::shared_ptr<Event> event) = 0;
 };
 } // namespace nostr
